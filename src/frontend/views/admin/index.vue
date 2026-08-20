@@ -556,7 +556,7 @@ import { t, useTranslation } from '../../utils/i18n'
 import { PING_NODE_FIELDS, validatePingNode } from '../../utils/pingNode.js'
 import { normalizeDisplayMode, resolveDisplayMode } from '../../utils/displayMode.js'
 import { applyMikusThemeOptions } from '../../utils/themeOptions.js'
-import { HISTORY } from '../../utils/constants.js'
+import { FRONTEND_WS_TIMEOUT_MINUTES_MAX, HISTORY } from '../../utils/constants.js'
 import { usePasswordVisibility } from '../../composables/usePasswordVisibility'
 import { useTurnstile } from './composables/useTurnstile'
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../../utils/server.js'
@@ -647,6 +647,13 @@ const normalizeLongHistoryPointsSetting = (value) => {
   )
 }
 
+const normalizeFrontendWsTimeoutMinutesSetting = (value) => {
+  const minutes = Number(value)
+  return Number.isInteger(minutes) && minutes >= 0 && minutes <= FRONTEND_WS_TIMEOUT_MINUTES_MAX
+    ? minutes
+    : 0
+}
+
 const normalizeResourceAlertModeSetting = (value) => {
   const mode = String(value || '').trim().toLowerCase()
   return mode === 'continuous' ? 'continuous' : 'average'
@@ -712,6 +719,8 @@ const normalizeResourceAlertRulesSetting = (value) => {
 }
 
 const isResourceAlertEnabled = (rules) => normalizeResourceAlertRulesSetting(rules).length > 0
+
+const isNotificationWebhookEnabled = () => settings.value.notification_webhook_enabled === true
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
 
@@ -827,14 +836,21 @@ const settings = ref({
   show_price: true,
   show_expire: true,
   show_tf: true,
-  show_time: true,
   wss_report_enabled: false,
+  frontend_ws_timeout_minutes: 0,
   long_history_points: String(HISTORY.DEFAULT_LONG_RANGE_POINTS),
   tg_notify: '0',
   expire_reminder: '0',
   resource_alert_rules: [],
   tg_bot_token: '',
   tg_chat_id: '',
+  notification_webhook_enabled: false,
+  notification_webhook_url: '',
+  notification_webhook_method: 'POST',
+  notification_webhook_format: 'json',
+  notification_webhook_headers: '',
+  notification_webhook_body: '{\n  "title": "{{emoji}} {{event}}",\n  "content": "{{notification}}"\n}',
+  notification_template: '{{emoji}}【CF Server Monitor】{{event}}\n\n{{message}}\n\n{{time}}',
   turnstile_enabled: false,
   turnstile_site_key: '',
   turnstile_secret_key: '',
@@ -874,7 +890,7 @@ const toggleAdminPasswordChange = () => {
 }
 
 const { visibility: passwordVisible, toggle: togglePassword } = usePasswordVisibility([
-  'login', 'tgBotToken', 'tgChatId', 'turnstileSecret', 'cloudflareToken', 'jwtSecret', 'password', 'confirmPassword'
+  'login', 'tgBotToken', 'tgChatId', 'notificationWebhookUrl', 'turnstileSecret', 'cloudflareToken', 'jwtSecret', 'password', 'confirmPassword'
 ])
 
 const {
@@ -1200,14 +1216,21 @@ const loadSettings = async () => {
         show_price: settingsData.show_price === 'true',
         show_expire: settingsData.show_expire === 'true',
         show_tf: settingsData.show_tf === 'true',
-        show_time: settingsData.show_time === 'true',
         wss_report_enabled: settingsData.wss_report_enabled === 'true' || settingsData.wss_report_enabled === true,
+        frontend_ws_timeout_minutes: normalizeFrontendWsTimeoutMinutesSetting(settingsData.frontend_ws_timeout_minutes),
         long_history_points: normalizeLongHistoryPointsSetting(settingsData.long_history_points),
         tg_notify: normalizeTgNotifySetting(settingsData.tg_notify),
         expire_reminder: normalizeExpireReminderSetting(settingsData.expire_reminder),
         resource_alert_rules: normalizeResourceAlertRulesSetting(settingsData.resource_alert_rules),
         tg_bot_token: settingsData.tg_bot_token || '',
         tg_chat_id: settingsData.tg_chat_id || '',
+        notification_webhook_enabled: settingsData.notification_webhook_enabled === 'true' || settingsData.notification_webhook_enabled === true,
+        notification_webhook_url: settingsData.notification_webhook_url || '',
+        notification_webhook_method: String(settingsData.notification_webhook_method || 'POST').toUpperCase() === 'GET' ? 'GET' : 'POST',
+        notification_webhook_format: ['json', 'form', 'text'].includes(String(settingsData.notification_webhook_format || '').toLowerCase()) ? String(settingsData.notification_webhook_format).toLowerCase() : 'json',
+        notification_webhook_headers: settingsData.notification_webhook_headers || '',
+        notification_webhook_body: settingsData.notification_webhook_body || '{\n  "title": "{{emoji}} {{event}}",\n  "content": "{{notification}}"\n}',
+        notification_template: settingsData.notification_template || '{{emoji}}【CF Server Monitor】{{event}}\n\n{{message}}\n\n{{time}}',
         turnstile_enabled: settingsData.turnstile_enabled === 'true',
         turnstile_login_enabled: settingsData.turnstile_login_enabled === 'true',
         turnstile_site_key: settingsData.turnstile_site_key || '',
@@ -1270,6 +1293,12 @@ const saveSettings = async () => {
     return
   }
 
+  const frontendWsTimeoutMinutes = Number(settings.value.frontend_ws_timeout_minutes)
+  if (!Number.isInteger(frontendWsTimeoutMinutes) || frontendWsTimeoutMinutes < 0 || frontendWsTimeoutMinutes > FRONTEND_WS_TIMEOUT_MINUTES_MAX) {
+    validationError.value = trans.value.invalidFrontendWsTimeoutMinutes
+    return
+  }
+
   const shouldChangePassword = changeAdminPassword.value && (
     settings.value.password.length > 0 ||
     settings.value.confirm_password.length > 0
@@ -1294,7 +1323,12 @@ const saveSettings = async () => {
   }
 
   if (isTgNotifyEnabled(settings.value.tg_notify) || isExpireReminderEnabled(settings.value.expire_reminder) || isResourceAlertEnabled(settings.value.resource_alert_rules)) {
-    if (!settings.value.tg_bot_token || settings.value.tg_bot_token.trim().length === 0) {
+    if (isNotificationWebhookEnabled()) {
+      if (!settings.value.notification_webhook_url || settings.value.notification_webhook_url.trim().length === 0) {
+        validationError.value = trans.value.notificationWebhookUrlRequired || 'Webhook URL is required'
+        return
+      }
+    } else if (!settings.value.tg_bot_token || settings.value.tg_bot_token.trim().length === 0) {
       validationError.value = trans.value.tgBotTokenRequired
       return
     }
@@ -1339,14 +1373,21 @@ const saveSettings = async () => {
       show_price: settings.value.show_price ? 'true' : 'false',
       show_expire: settings.value.show_expire ? 'true' : 'false',
       show_tf: settings.value.show_tf ? 'true' : 'false',
-      show_time: settings.value.show_time ? 'true' : 'false',
       wss_report_enabled: settings.value.wss_report_enabled ? 'true' : 'false',
+      frontend_ws_timeout_minutes: String(frontendWsTimeoutMinutes),
       long_history_points: normalizeLongHistoryPointsSetting(settings.value.long_history_points),
       tg_notify: normalizeTgNotifySetting(settings.value.tg_notify),
       expire_reminder: normalizeExpireReminderSetting(settings.value.expire_reminder),
       resource_alert_rules: normalizeResourceAlertRulesSetting(settings.value.resource_alert_rules),
       tg_bot_token: settings.value.tg_bot_token,
       tg_chat_id: settings.value.tg_chat_id,
+      notification_webhook_enabled: settings.value.notification_webhook_enabled ? 'true' : 'false',
+      notification_webhook_url: settings.value.notification_webhook_url,
+      notification_webhook_method: settings.value.notification_webhook_method === 'GET' ? 'GET' : 'POST',
+      notification_webhook_format: ['json', 'form', 'text'].includes(settings.value.notification_webhook_format) ? settings.value.notification_webhook_format : 'json',
+      notification_webhook_headers: settings.value.notification_webhook_headers,
+      notification_webhook_body: settings.value.notification_webhook_body,
+      notification_template: settings.value.notification_template,
       turnstile_enabled: settings.value.turnstile_enabled ? 'true' : 'false',
       turnstile_login_enabled: settings.value.turnstile_login_enabled ? 'true' : 'false',
       turnstile_site_key: settings.value.turnstile_site_key,
@@ -1932,7 +1973,14 @@ const sendTestNotification = async () => {
     const result = await adminApiForSite({
       action: 'send_test_notification',
       tg_bot_token: settings.value.tg_bot_token,
-      tg_chat_id: settings.value.tg_chat_id
+      tg_chat_id: settings.value.tg_chat_id,
+      notification_webhook_enabled: settings.value.notification_webhook_enabled ? 'true' : 'false',
+      notification_webhook_url: settings.value.notification_webhook_url,
+      notification_webhook_method: settings.value.notification_webhook_method,
+      notification_webhook_format: settings.value.notification_webhook_format,
+      notification_webhook_headers: settings.value.notification_webhook_headers,
+      notification_webhook_body: settings.value.notification_webhook_body,
+      notification_template: settings.value.notification_template
     })
     if (!result.error) {
       alertMessage.value = getMessage(result.data.message) || trans.value.testNotificationSent
